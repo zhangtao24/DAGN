@@ -401,7 +401,7 @@ var OSM1 = pc1.gt(-0.12).and(pc1.lte(0.89))
 var A41 = LL_clipped1.select('A41');
 
 var OSM2 = A41.gt(-0.227).and(A41.lte(-0.171))
-              .and(Elevation.gt(1513.53)).and(Elevation.lt(1634.46))
+              .and(pc4.gt(1.309)).and(pc4.lt(3.140))
               .and(pc2.gt(-1.99)).and(pc2.lt(-1.239)).selfMask();
 
 var OSM_fa = OSM1.and(OSM2).clip(OSM);
