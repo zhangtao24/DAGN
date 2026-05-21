@@ -1,1 +1,781 @@
+var table = ee.FeatureCollection("projects/ee-1065531055/assets/paper4_yumeng_roi"),
+    table2 = ee.FeatureCollection("projects/ee-1065531055/assets/yumeng_Li");
+
+//**********************************In this code, "table" represents the scope of the study area, 
+while "table2" represents the scope of 15 types of lithology after reconstruction, in shp 
+format**************************************//
+
+var roi = table;
+
+Map.addLayer(roi, {},'roi', false);
+Map.centerObject(roi); 
+var area_km2= roi.geometry().area().divide(1e6);
+// var area_km2 = ee.Geometry(roi).area({'maxError': 1}).divide(1e6);
+print('ROI面积（km²）:', area_km2);
+
+
+var dataset = ee.ImageCollection('ESA/WorldCover/v100').first();
+var dataset1 = dataset.clip(roi);
+
+var water_ESA = dataset1.eq(80);
+var urban_ESA = dataset1.eq(50);
+var foret_ESA = dataset1.eq(10);
+var keepMask = water_ESA.or(urban_ESA).or(foret_ESA).not();
+
+//***********************************************************************************Sentinel-2
+// remove cloud from Sentinel-2
+function rmS2cloud(image) {
+  var qa = image.select('QA60');
+  
+  // Bits 10 and 11 are clouds and cirrus, respectively.
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  // var mask2 = image.select('B2').lte(2000);
+  return image.updateMask(mask).toDouble().divide(10000)
+              .copyProperties(image, ["system:time_start", "system:time_end"]);
+}
+
+var LL_clipped = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                  .filterBounds(roi)
+                  .filterDate('2021-06-01','2021-10-30') 
+                  // Pre-filter to get less cloudy granules.
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',20)) 
+                  .select('B1','B2','B3','B4','B5','B6','B7','B8','B8A','B9','B11','B12','QA60')
+                  .map(rmS2cloud)
+                  .median()
+                  .clip(roi)
+                  
+Map.addLayer(LL_clipped, {bands: ['B4', 'B3', 'B2'], max: 0.5, gamma: 2}, 'S2 Image',false);
+
+
+//***********************************************************************************landsat
+function rmCloud_TOA(image) {
+  var CloudScore = ee.Algorithms.Landsat.simpleCloudScore(image);
+  var image_rm =CloudScore.select("cloud").lte(30);
+  return image.updateMask(image_rm);
+}
+
+var l8SR = ee.ImageCollection('LANDSAT/LC08/C02/T1_TOA')
+                  .filterBounds(roi)
+                  .filterDate('2021-06-01','2021-10-30')
+                  .map(rmCloud_TOA)
+                  .select('B1','B2','B3','B4','B5','B6','B7','B8','B9','B10','B11')
+                  .median()   //中值合成
+                  .clip(roi)
+
+// print("l8SR",l8SR)
+
+var rgbVis = {
+  min: 0.0,
+  max: 0.3,
+  gamma: 1.4,
+  bands: ['B4', 'B3', 'B2'],
+};
+
+Map.addLayer(l8SR, rgbVis, 'l8SR',false);
+
+//***********************************************************************************embeddings
+var sev1 = ee.ImageCollection('GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL')
+                  .filterBounds(roi)
+                  .filterDate('2021-01-01','2021-12-31')
+                  .median()
+                  .clip(roi)
+                  
+var visParams = {min: -0.3, max: 0.3, bands: ['A01', 'A16', 'A09']};
+Map.addLayer(sev1, visParams, 'embeddings');
+
+//***********************************************************************************DEM
+var srtm = ee.Image('USGS/SRTMGL1_003').clip(roi); 
+
+//【关键步骤】重投影与重采样
+// 目的：把 30m 的 DEM 变成 10m，以便与 S2 像素对齐
+// 使用 'bicubic' (双三次插值) 可以让 DEM 更平滑，避免梯田状伪影影响粗糙度计算
+var dem10m = srtm.resample('bicubic').reproject({
+  crs: LL_clipped.projection(), 
+  scale: 10   
+});
+
+var terrain = ee.Algorithms.Terrain(dem10m)
+print(terrain)
+
+var roughness = dem10m.reduceNeighborhood({
+  reducer: ee.Reducer.stdDev(),
+  kernel: ee.Kernel.square(1) 
+}).rename('rugosity');
+
+
+var bands1=["B2","B3","B4","B8","B11","B12"]
+//***********************************************************************************PCA
+// 定义一个函数，用于对矢量进行矩形分块
+function shpRectBlock(vector, numHorizontal, numVertical) {  
+  // 检查输入是否为矢量  
+  if (!(vector instanceof ee.Geometry || vector instanceof ee.Feature || vector instanceof ee.FeatureCollection)) {  
+    throw new Error('Input must be a Geometry, Feature, or FeatureCollection.');  
+  }  
+  // 如果是 FeatureCollection，提取其几何  
+  if (vector instanceof ee.FeatureCollection) {  
+    vector = vector.geometry();  
+  } 
+  else if (vector instanceof ee.Feature) {  
+    vector = vector.geometry();  
+  }
+  else {
+    vector = vector;
+  }
+
+  // 获取矢量的边界框  
+  var bounds = vector.bounds();  
+  var coords = ee.List(bounds.coordinates().get(0)); // 
+  var xmin = ee.Number(ee.List(coords.get(0)).get(0));  
+  var ymin = ee.Number(ee.List(coords.get(0)).get(1));  
+  var xmax = ee.Number(ee.List(coords.get(2)).get(0));  
+  var ymax = ee.Number(ee.List(coords.get(2)).get(1));  
+
+  // 计算每个矩形块的宽度和高度  
+  var xStep = xmax.subtract(xmin).divide(numHorizontal);  
+  var yStep = ymax.subtract(ymin).divide(numVertical);  
+
+  // 创建矩形块  
+  var rectangles = ee.List.sequence(0, numHorizontal - 1).map(function (i) {  
+    return ee.List.sequence(0, numVertical - 1).map(function (j) {  
+      var x0 = xmin.add(xStep.multiply(i));  
+      var x1 = x0.add(xStep);  
+      var y0 = ymin.add(yStep.multiply(j));  
+      var y1 = y0.add(yStep);
+      var tmpGeo = ee.Geometry.Rectangle([x0, y0, x1, y1]);
+      var GeoCommon = tmpGeo.intersection(vector,1);
+      // return ee.Feature(ee.Geometry.Rectangle([x0, y0, x1, y1]));
+      return ee.Feature(GeoCommon);
+    });  
+  }).flatten();  
+
+  // 将矩形块转换为 FeatureCollection  
+  var rectanglesFC = ee.FeatureCollection(rectangles).filterBounds(vector);  
+
+  return rectanglesFC;  
+}
+
+function pca (img) {
+    var bandNames = bands1;
+    var scale = 200;
+    var region = roi;
+    var year = img.get('year');
+
+    var meanDict = img.reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: region,
+        scale: scale,
+        maxPixels: 10e13
+    });
+    var means = ee.Image.constant(meanDict.values(bandNames));
+    var centered = img.subtract(means);
+
+
+    var getNewBandNames = function(prefix) {
+        var seq = ee.List.sequence(1, 6);
+        return seq.map(function(n) {
+            return ee.String(prefix).cat(ee.Number(n).int());
+        });
+    };
+
+    var getPrincipalComponents = function(centered, scale, region) {
+        var arrays = centered.toArray();
+        // 添加波段权重
+        var weights = ee.Array([1, 1, 1, 1, 2 ,2]); // 根据实际波段数量调整
+        arrays = arrays.multiply(weights);
+
+
+        var covar = arrays.reduceRegion({
+            reducer: ee.Reducer.centeredCovariance(),
+            geometry: region,
+            scale: scale,
+            bestEffort: true,
+            maxPixels: 10e13
+        });
+        var covarArray = ee.Array(covar.get('array'));
+        var eigens = covarArray.eigen();
+        var eigenValues = eigens.slice(1, 0, 1);
+        var eigenVectors = eigens.slice(1, 1);
+        var eigenValuesList = eigenValues.toList().flatten();
+        var total = eigenValuesList.reduce(ee.Reducer.sum());
+        var percentageVariance = eigenValuesList.map(function(item) {
+            return (ee.Number(item).divide(total)).multiply(100).format('%.2f');
+        });
+        var arrayImage = arrays.toArray(1);
+        var principalComponents = ee.Image(eigenVectors).matrixMultiply(arrayImage);
+        var sdImage = ee.Image(eigenValues.sqrt())
+            .arrayProject([0]).arrayFlatten([getNewBandNames('SD')]);
+        return principalComponents
+            .arrayProject([0])
+            .arrayFlatten([getNewBandNames('PC', bandNames)])
+            .divide(sdImage)
+            .set('eigensValue', eigenValuesList)
+            .set('eigenVectors', eigenVectors)
+            .set('各个主成分的所占总信息量比例', percentageVariance);
+    };
+
+    img = getPrincipalComponents(centered,scale, region);
+    return img;
+}
+var pcImage = pca(LL_clipped.select(bands1));  
+var pcImage1=pcImage.select('PC3', 'PC2', 'PC1', 'PC4', 'PC5', 'PC6')
+
+var pc1 = pcImage1.select('PC1');
+var pc2 = pcImage1.select('PC2');
+var pc3 = pcImage1.select('PC3');
+
+Map.addLayer(
+  pcImage, 
+  {bands: ['PC3', 'PC2', 'PC1'], min: -2, max: 2}, 
+  'Landsat 8 - PCA', 
+  false
+);
+
+//***********************************************************************************addband
+
+var LL_clipped2=ee.Image.cat([l8SR,LL_clipped,terrain,pcImage1,sev1]).float().clip(roi)
+
+var LL_clipped1= LL_clipped2//.addBands(roughness)
+                            .updateMask(keepMask);
+print(LL_clipped1)
+
+var bands = ['B1','B2', 'B3', 'B4', 'B5', 'B6', 
+'B7','B8','B10','B9','B11','elevation','slope','aspect','B1_1','B2_1','B3_1','B4_1','B5_1'
+,'B6_1','B7_1','B8_1','B8A','B9_1','B11_1','B12','PC1','PC2','PC3'];
+
+// // -----------------------------------------------------------------------白云石大理岩 DM0
+var lithology_all = ee.ImageCollection([image, image2]).mosaic();
+
+var DM_shrunk = table2.filter(ee.Filter.eq("YSEB", '白云石大理岩0'));
+
+var DM = DM_shrunk.geometry().buffer(-200)
+
+var DM1 = pc1.gt(-1.34).and(pc1.lte(-0.01))
+              .and(pc2.gt(-1.32)).and(pc2.lt(0))
+              .and(pc3.gt(-4.59)).and(pc3.lt(-1.52)).selfMask();
+
+var A24 = LL_clipped1.select('A24');
+var A01 = LL_clipped1.select('A01');
+var pc4 = pcImage1.select('PC4');
+
+var DM2 = pc4.gt(3.711).and(pc4.lte(6.629))
+              .and(A24.gt(-0.115)).and(A24.lt(0.084))
+              .and(A01.gt(0.026)).and(A01.lt(0.151)).selfMask();
+
+var DM_fa = DM1.and(DM2).clip(DM);
+
+var DM_fa = lithology_all.eq(1).selfMask();
+// 采样
+var DM_samples = DM_fa.stratifiedSample({
+  numPoints: 1500,
+  classBand: null,
+  region: DM,
+  scale: 10,
+  seed: 42,
+  geometries: true,
+  dropNulls: true,
+});
+
+var Points0 = DM_samples.map(function(fea){
+  return fea.set('landcover',0)
+})
+
+// // -----------------------------------------------------------------------变玄武岩-变凝灰岩1 MBT
+var MBT_shrunk = table2.filter(ee.Filter.eq("YSEB", '变玄武岩-变凝灰岩1'));
+
+var MBT = MBT_shrunk.geometry().buffer(-200)
+
+var MBT1 = pc1.gt(2.45).and(pc1.lte(3.25))
+              .and(pc2.gt(0.92)).and(pc2.lt(1.26))
+              .and(pc3.gt(0.2)).and(pc3.lt(0.91)).selfMask();
+
+var L8_B6 = LL_clipped1.select('B6');
+var S2_B9 = LL_clipped1.select('B9_1');
+var S2_B11 = LL_clipped1.select('B11_1');
+
+var MBT2 = L8_B6.gt(0.099).and(L8_B6.lte(0.154))
+              .and(S2_B9.gt(0.08)).and(S2_B9.lt(0.117))
+              .and(S2_B11.gt(0.105)).and(S2_B11.lt(0.164)).selfMask();
+
+var MBT_fa = MBT1.and(MBT2).clip(MBT);
+
+var MBT_fa = lithology_all.eq(2).selfMask();
+// 采样
+var MBT_samples = MBT_fa.stratifiedSample({
+  numPoints: 1500,
+  classBand: null,
+  region: MBT,
+  scale: 10,
+  seed: 42,
+  geometries: true,
+  dropNulls: true,
+});
+
+var Points1 = MBT_samples.map(function(fea){
+  return fea.set('landcover',1)
+})
+
+// // -----------------------------------------------------------------------变质砂岩2  MS
+var MS_shrunk = table2.filter(ee.Filter.eq("YSEB", '变质砂岩2'));
+
+var MS = MS_shrunk.geometry().buffer(-200)
+
+var MS1 = pc1.gt(0.04).and(pc1.lte(1.36))
+              .and(pc2.gt(-0.42)).and(pc2.lt(0.5))
+              .and(pc3.gt(-1.44)).and(pc3.lt(0.24)).selfMask();
+
+var A29 = LL_clipped1.select('A29');
+var Elevation = LL_clipped1.select('elevation');
+var Slop = LL_clipped1.select('slope');
+
+var MS2 = A29.gt(0.175).and(A29.lte(0.376))
+              .and(Elevation.gt(2445.79)).and(Elevation.lt(2974.20))
+              .and(Slop.gt(12.31)).and(Slop.lt(31.68)).selfMask();
+
+var MS_fa = MS1.and(MS2).clip(MS);
+
+var MS_fa = lithology_all.eq(3).selfMask();
+// 采样
+var MS_samples = MS_fa.stratifiedSample({
+  numPoints: 1500,
+  classBand: null,
+  region: MS,
+  scale: 10,
+  seed: 42,
+  geometries: true,
+  dropNulls: true,
+});
+
+var Points2 = MS_samples.map(function(fea){
+  return fea.set('landcover',2)
+})
+
+// // -----------------------------------------------------------------------含砂质泥岩3 Sandy mudstone SM
+var SM_shrunk = table2.filter(ee.Filter.eq("YSEB", '含砂质泥岩3'));
+
+var SM = SM_shrunk.geometry().buffer(-200);
+
+var SM1 = pc1.gt(-2.3).and(pc1.lte(-1.23))
+              .and(pc2.gt(-0.57)).and(pc2.lt(0.35))
+              .and(pc3.gt(-2.93)).and(pc3.lt(-0.57)).selfMask();
+
+var A14 = LL_clipped1.select('A14');
+var A49 = LL_clipped1.select('A49');
+var S2_B12 = LL_clipped1.select('B12');
+
+var SM2 = A14.gt(0.001).and(A14.lte(0.082))
+              .and(A49.gt(-0.228)).and(A49.lt(-0.13))
+              .and(S2_B12.gt(0.41)).and(S2_B12.lt(0.487)).selfMask();
+
+var SM_fa = SM1.and(SM2).clip(SM);
+
+var SM_fa = lithology_all.eq(4).selfMask();
+// 采样
+var SM_samples = SM_fa.stratifiedSample({
+  numPoints: 1500,
+  classBand: null,
+  region: SM,
+  scale: 10,
+  seed: 42,
+  geometries: true,
+  dropNulls: true,
+});
+
+var Points3 = SM_samples.map(function(fea){
+  return fea.set('landcover',3)
+})
+
+// // -----------------------------------------------------------------------含云母石英片岩4  MQC
+var OSM_shrunk = table2.filter(ee.Filter.eq("YSEB", '含云母石英片岩4'));
+
+var OSM = OSM_shrunk.geometry().buffer(-200);
+
+var OSM1 = pc1.gt(-0.12).and(pc1.lte(0.89))
+              .and(pc2.gt(1.21)).and(pc2.lt(1.97))
+              .and(pc3.gt(-1.87)).and(pc3.lt(-0.33)).selfMask();
+
+var A41 = LL_clipped1.select('A41');
+
+var OSM2 = A41.gt(-0.227).and(A41.lte(-0.171))
+              .and(Elevation.gt(1513.53)).and(Elevation.lt(1634.46))
+              .and(pc2.gt(-1.99)).and(pc2.lt(-1.239)).selfMask();
+
+var OSM_fa = OSM1.and(OSM2).clip(OSM);
+
+var OSM_fa = lithology_all.eq(5).selfMask();
+// 采样
+var OSM_samples = OSM_fa.stratifiedSample({
+  numPoints: 1500,
+  classBand: null,
+  region: OSM,
+  scale: 10,
+  seed: 42,
+  geometries: true,
+  dropNulls: true,
+});
+
+var Points4 = OSM_samples.map(function(fea){
+  return fea.set('landcover',4)
+})
+
+// // -----------------------------------------------------------------------黑云斜长片麻岩5  BPG
+var OSB_shrunk = table2.filter(ee.Filter.eq("YSEB", '黑云斜长片麻岩5'));
+
+var OSB = OSB_shrunk.geometry().buffer(-200);
+
+var OSB1 = pc1.gt(0.3).and(pc1.lte(1.4))
+              .and(pc2.gt(0.84)).and(pc2.lt(1.6))
+              .and(pc3.gt(-1.28)).and(pc3.lt(0)).selfMask();
+
+var A02 = LL_clipped1.select('A02');
+var A55 = LL_clipped1.select('A55');
+var L8_B11 = LL_clipped1.select('B11');
+
+var OSB2 = A02.gt(-0.053).and(A02.lte(0.009))
+              .and(A55.gt(0.078)).and(A55.lt(0.128))
+              .and(L8_B11.gt(291.69)).and(L8_B11.lt(301.36)).selfMask();
+
+var OSB_fa = OSB1.and(OSB2).clip(OSB);
+
+var OSB_fa = lithology_all.eq(6).selfMask();
+// 采样
+var OSB_samples = OSB_fa.stratifiedSample({
+  numPoints: 1500,
+  classBand: null,
+  region: OSB,
+  scale: 10,
+  seed: 42,
+  geometries: true,
+  dropNulls: true,
+});
+
+var Points5 = OSB_samples.map(function(fea){
+  return fea.set('landcover',5)
+})
+
+// // -----------------------------------------------------------------------花岗闪长岩6  Granodiorite  GD
+var GD_shrunk = table2.filter(ee.Filter.eq("YSEB", '花岗闪长岩6'));
+
+var GD = GD_shrunk.geometry().buffer(-200);
+
+var GD1 = pc1.gt(-1.1).and(pc1.lte(0.05))
+              .and(pc2.gt(-0.3)).and(pc2.lt(0.55))
+              .and(pc3.gt(0.43)).and(pc3.lt(1.81)).selfMask();
+
+var A54 = LL_clipped1.select('A54');
+var A62 = LL_clipped1.select('A62');
+
+var GD2 = A54.gt(0.221).and(A54.lte(0.266))
+              .and(A62.gt(-0.311)).and(A62.lt(-0.241))
+              .and(Elevation.gt(1515.89)).and(Elevation.lt(1634.10)).selfMask();
+
+var GD_fa1 = GD1.and(GD2).clip(GD);
+
+var GD_fa = lithology_all.eq(7).selfMask();
+// 采样
+var GD_samples = GD_fa.stratifiedSample({
+  numPoints: 1500,
+  classBand: null,
+  region: GD,
+  scale: 10,
+  seed: 42,
+  geometries: true,
+  dropNulls: true,
+});
+
+var Points6 = GD_samples.map(function(fea){
+  return fea.set('landcover',6)
+})
+
+// // -----------------------------------------------------------------------花岗质侵入岩7  UG
+var GIR_shrunk = table2.filter(ee.Filter.eq("YSEB", '花岗质侵入岩7'));
+
+var GIR = GIR_shrunk.geometry().buffer(-200);
+
+var GIR1 = pc1.gt(-1.66).and(pc1.lte(-0.38))
+              .and(pc2.gt(-0.58)).and(pc2.lt(0.31))
+              .and(pc3.gt(-1.08)).and(pc3.lt(1.04)).selfMask();
+
+var A11 = LL_clipped1.select('A11');
+
+var GIR2 = A11.gt(-0.162).and(A11.lte(-0.12))
+              .and(Elevation.gt(1837.1)).and(Elevation.lt(1969.89))
+              .and(L8_B11.gt(307.43)).and(L8_B11.lt(312.15)).selfMask();
+
+var GIR_fa = GIR1.and(GIR2).clip(GIR);
+
+var GIR_fa = lithology_all.eq(8).selfMask();
+// 采样
+var GIR_samples = GIR_fa.stratifiedSample({
+  numPoints: 1500,
+  classBand: null,
+  region: GIR,
+  scale: 10,
+  seed: 42,
+  geometries: true,
+  dropNulls: true,
+});
+
+var Points7 = GIR_samples.map(function(fea){
+  return fea.set('landcover',7)
+})
+
+// // -----------------------------------------------------------------------砾岩-砂岩-含砂质泥岩8    UCS
+var QCS_shrunk = table2.filter(ee.Filter.eq("YSEB", '砾岩-砂岩-含砂质泥岩8'));
+
+var QCS = QCS_shrunk.geometry().buffer(-200);
+
+var QCS1 = pc1.gt(-1.39).and(pc1.lte(0.47))
+              .and(pc2.gt(-0.21)).and(pc2.lt(0.54))
+              .and(pc3.gt(-0.38)).and(pc3.lt(0.94)).selfMask();
+
+var A03 = LL_clipped1.select('A03');
+var A06 = LL_clipped1.select('A06');
+var A15 = LL_clipped1.select('A15');
+
+var QCS2 = A05.gt(0.187).and(A03.lte(0.226))
+              .and(A06.gt(-0.208)).and(A06.lt(-0.163))
+              .and(A33.gt(-0.287)).and(A15.lt(-0.232)).selfMask();
+
+var QCS_fa1 = QCS1.and(QCS2).clip(QCS);
+
+var QCS_fa = lithology_all.eq(9).selfMask();
+// 采样
+var QCS_samples = QCS_fa.stratifiedSample({
+  numPoints: 1500,
+  classBand: null,
+  region: QCS,
+  scale: 10,
+  seed: 42,
+  geometries: true,
+  dropNulls: true,
+});
+
+var Points8 = QCS_samples.map(function(fea){
+  return fea.set('landcover',8)
+})
+
+Map.addLayer(QCS_shrunk, {'palette':['red']}, 'MG_500')
+Map.addLayer(QCS_fa1, {'palette':['green']}, 'MG_PCA');
+// Map.addLayer(QCS2, {'palette':['#7a34d6']}, 'MG_SEA')
+Map.addLayer(QCS_fa, {'palette':['blue']}, 'finalMask');
+// Map.addLayer(Points8)
+// print(Points8.size())
+
+// // -----------------------------------------------------------------------流纹英安斑岩9 Rhyodacite porphyry RP
+var RP_shrunk = table2.filter(ee.Filter.eq("YSEB", '流纹英安斑岩9'));
+
+var RP = RP_shrunk.geometry().buffer(-200);
+
+var RP1 = pc1.gt(1.2).and(pc1.lte(2.15))
+              .and(pc2.gt(1.04)).and(pc2.lt(1.95))
+              .and(pc3.gt(-2.26)).and(pc3.lt(-1.08)).selfMask();
+
+var A21 = LL_clipped1.select('A21');
+var S2_B6 = LL_clipped1.select('B6_1');
+
+var RP2 = A02.gt(-0.111).and(A02.lte(-0.026))
+              .and(A21.gt(-0.042)).and(A21.lt(0.102))
+              .and(S2_B6.gt(0.096)).and(S2_B6.lt(0.147)).selfMask();
+
+var RP_fa = RP1.and(RP2).clip(RP);
+
+var RP_fa = lithology_all.eq(10).selfMask();
+// 采样
+var RP_samples = RP_fa.stratifiedSample({
+  numPoints: 1500,
+  classBand: null,
+  region: RP,
+  scale: 10,
+  seed: 42,
+  geometries: true,
+  dropNulls: true,
+});
+
+var Points9 = RP_samples.map(function(fea){
+  return fea.set('landcover',9)
+})
+
+// // -----------------------------------------------------------------------砂质粘土-长石砂岩10  SCFC
+var SCFC_shrunk = table2.filter(ee.Filter.eq("YSEB", '砂质粘土-长石砂岩10'));
+
+var SCFC = SCFC_shrunk.geometry().buffer(-200);
+
+var SCFC1 = pc1.gt(0.65).and(pc1.lte(2.32))
+              .and(pc2.gt(-4.66)).and(pc2.lt(-1.84))
+              .and(pc3.gt(-2.68)).and(pc3.lt(-0.14)).selfMask();
+
+var A13 = LL_clipped1.select('A13');
+var A51 = LL_clipped1.select('A51');
+var A54 = LL_clipped1.select('A54');
+
+var SCFC2 = A13.gt(0.024).and(A13.lte(0.143))
+              .and(A51.gt(0.076)).and(A51.lt(0.172))
+              .and(A54.gt(-0.012)).and(A54.lt(0.077)).selfMask();
+
+var SCFC_fa = SCFC1.and(SCFC2).clip(SCFC);
+
+var SCFC_fa = lithology_all.eq(11).selfMask();
+// 采样
+var SCFC_samples = SCFC_fa.stratifiedSample({
+  numPoints: 1500,
+  classBand: null,
+  region: SCFC,
+  scale: 10,
+  seed: 42,
+  geometries: true,
+  dropNulls: true,
+});
+
+var Points10 = SCFC_samples.map(function(fea){
+  return fea.set('landcover',10)
+})
+
+// // -----------------------------------------------------------------------石英闪长岩11  Quartz diorite QD
+var QD_shrunk = table2.filter(ee.Filter.eq("YSEB", '石英闪长岩11'));
+
+var QD = QD_shrunk.geometry().buffer(-200);
+
+var QD1 = pc1.gt(0.2).and(pc1.lte(1.34))
+              .and(pc2.gt(0.35)).and(pc2.lt(1.04))
+              .and(pc3.gt(-0.35)).and(pc3.lt(0.9)).selfMask();
+
+var A52 = LL_clipped1.select('A52');
+var A62 = LL_clipped1.select('A62');
+var S2_B8A = LL_clipped1.select('B8A');
+
+var QD2 = A52.gt(0.176).and(A52.lte(0.236))
+              .and(A62.gt(-0.298)).and(A62.lt(-0.221))
+              .and(S2_B8A.gt(0.182)).and(S2_B8A.lt(0.247)).selfMask();
+
+var QD_fa = QD1.and(QD2).clip(QD);
+
+var QD_fa = lithology_all.eq(12).selfMask();
+// 采样
+var QD_samples = QD_fa.stratifiedSample({
+  numPoints: 1500,
+  classBand: null,
+  region: QD,
+  scale: 10,
+  seed: 42,
+  geometries: true,
+  dropNulls: true,
+});
+
+var Points11 = QD_samples.map(function(fea){
+  return fea.set('landcover',11)
+})
+
+// // -----------------------------------------------------------------------长石砂岩、砾岩12 FSC
+var FSC_shrunk = table2.filter(ee.Filter.eq("YSEB", '长石砂岩、砾岩12'));
+
+var FSC = FSC_shrunk.geometry().buffer(-200);
+
+var FSC1 = pc1.gt(-1.21).and(pc1.lte(-0.15))
+              .and(pc2.gt(0.21)).and(pc2.lt(0.87))
+              .and(pc3.gt(-2.4)).and(pc3.lt(-0.88)).selfMask();
+
+var A29 = LL_clipped1.select('A29');
+var A36 = LL_clipped1.select('A36');
+var A56 = LL_clipped1.select('A56');
+
+var FSC2 = A29.gt(0.087).and(A29.lte(0.232))
+              .and(A36.gt(-0.257)).and(A36.lt(-0.156))
+              .and(A56.gt(-0.27)).and(A56.lt(-0.202)).selfMask();
+
+var FSC_fa = FSC1.and(FSC2).clip(FSC);
+var FSC_fa = lithology_all.eq(13).selfMask();
+// 采样
+var FSC_samples = FSC_fa.stratifiedSample({
+  numPoints: 1500,
+  classBand: null,
+  region: FSC,
+  scale: 10,
+  seed: 42,
+  geometries: true,
+  dropNulls: true,
+});
+
+var Points12 = FSC_samples.map(function(fea){
+  return fea.set('landcover',12)
+})
+
+// // -----------------------------------------------------------------------黄土13  Quaternary Loess  L0
+var QL_shrunk = table2.filter(ee.Filter.eq("YSEB", '黄土13'));
+
+var QL = QL_shrunk.geometry().buffer(-200);
+
+var QL1 = pc1.gt(-3.06).and(pc1.lte(-1.48))
+              .and(pc2.gt(-2.07)).and(pc2.lt(-1.22))
+              .and(pc3.gt(1.51)).and(pc3.lt(3.01)).selfMask();
+
+var L8_B3 = LL_clipped1.select('B3');
+
+var QL2 = L8_B3.gt(0.273).and(L8_B3.lte(0.335))
+              .and(S2_B6.gt(0.379)).and(S2_B6.lt(0.506))
+              .and(A56.gt(0.044)).and(A56.lt(0.106)).selfMask();
+
+var QL_fa = QL1.and(QL2).clip(QL);
+
+var QL_fa = lithology_all.eq(14).selfMask();
+// 采样
+var QL_samples = QL_fa.stratifiedSample({
+  numPoints: 1500,
+  classBand: null,
+  region: QL,
+  scale: 10,
+  seed: 42,
+  geometries: true,
+  dropNulls: true,
+});
+ 
+var Points13 = QL_samples.map(function(fea){
+  return fea.set('landcover',13)
+})
+
+
+// var DM_final = DM_fa.selfMask().rename('lithology').toInt();
+// var MBT_final = MBT_fa.selfMask().multiply(2).rename('lithology').toInt();
+// var MS_final = MS_fa.selfMask().multiply(3).rename('lithology').toInt();
+// var SM_final = SM_fa.selfMask().multiply(4).rename('lithology').toInt();
+// var OSM_final = OSM_fa.selfMask().multiply(5).rename('lithology').toInt();
+// var OSB_final = OSB_fa.selfMask().multiply(6).rename('lithology').toInt();
+// var GD_final = GD_fa.selfMask().multiply(7).rename('lithology').toInt();
+// var GIR_final = GIR_fa.selfMask().multiply(8).rename('lithology').toInt();
+// var QCS_final = QCS_fa.selfMask().multiply(9).rename('lithology').toInt();
+// var RP_final = RP_fa.selfMask().multiply(10).rename('lithology').toInt();
+// var SCFC_final = SCFC_fa.selfMask().multiply(11).rename('lithology').toInt();
+// var QD_final = QD_fa.selfMask().multiply(12).rename('lithology').toInt();
+// var FSC_final = FSC_fa.selfMask().multiply(13).rename('lithology').toInt();
+// var QL_final = QL_fa.selfMask().multiply(14).rename('lithology').toInt();
+
+// var merged_lithology = ee.ImageCollection([DM_final, MBT_final, MS_final,SM_final,OSM_final,OSB_final,
+// GD_final,GIR_final,QCS_final,RP_final,SCFC_final,QD_final,FSC_final,QL_final]).mosaic();
+
+var samples = ee.FeatureCollection([Points0,Points1,Points2,Points3,Points4,Points5,Points6,Points7,Points8,
+Points9,Points10,Points11,Points12,Points13]).flatten();
+
+print(Points10.size())
+print(samples.size())
+
+var f5 = lithology_all.eq(7).selfMask()
+
+Map.addLayer(f5, {'palette':['blue']}, 'f5');
+Map.addLayer(GD_fa1, {'palette':['green']}, 'SCFC_fa');
+
+var sample_info = LL_clipped1.sampleRegions({
+  collection: samples,
+  properties: ['landcover'],
+  scale: 10,
+  tileScale:16,
+  geometries: true
+});
+
+Export.table.toAsset(sample_info)
+
+
 
